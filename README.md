@@ -1,5 +1,8 @@
 # Gmail Cleaner
 
+![image](https://github.com/user-attachments/assets/a93c12c0-497b-4078-a8ba-bd2a262b5ddf)
+
+
 An intelligent email management tool that helps organize your Gmail inbox by automatically:
 
 - Identifying and archiving receipts
