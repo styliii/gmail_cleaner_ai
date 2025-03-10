@@ -32,10 +32,18 @@ class EmailProcessor:
         self.deleted_details = []
         self.important_details = []
         
-        # Initialize OpenAI
-        openai.api_key = os.getenv('OPENAI_API_KEY')
-        if not openai.api_key:
-            print("Warning: OPENAI_API_KEY not found in environment variables")
+        # API usage tracking
+        self.total_tokens_used = 0
+        self.total_api_calls = 0
+        self.total_api_cost = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        
+        # Initialize OpenAI client
+        openai_api_key = os.getenv('OPENAI_API_KEY')
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        self.client = openai.OpenAI(api_key=openai_api_key)
         
         # Create Receipt label if it doesn't exist
         self._ensure_receipt_label()
@@ -112,13 +120,13 @@ class EmailProcessor:
         return False
 
     def process_inbox(self, batch_size=100):
-        """Process emails in the inbox within 30-60 days old range."""
+        """Process emails in the inbox from the past 3 days."""
         print("\nStarting email processing...")
         
-        # Calculate date range
+        # Calculate date range for past 3 days
         now = datetime.now(timezone.utc)
-        older_than = int((now - timedelta(days=30)).timestamp())
-        newer_than = int((now - timedelta(days=31)).timestamp())
+        older_than = int((now - timedelta(days=0)).timestamp())  # Now
+        newer_than = int((now - timedelta(days=3)).timestamp())  # 3 days ago
         
         print(f"Searching for emails between {datetime.fromtimestamp(newer_than)} and {datetime.fromtimestamp(older_than)}")
         
@@ -211,75 +219,243 @@ class EmailProcessor:
             except Exception as e:
                 print(f"Error processing message {message['id']}: {str(e)}")
 
+    def _is_past_date(self, text: str, message_date: str) -> bool:
+        """Check if a date mentioned in the text is in the past."""
+        try:
+            # Convert message date to datetime
+            message_dt = datetime.strptime(message_date, '%Y-%m-%d %H:%M:%S')
+            
+            # Common date patterns
+            date_patterns = [
+                r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?',
+                r'\d{1,2}/\d{1,2}(?:/\d{2,4})?',
+                r'\d{4}-\d{2}-\d{2}',
+                r'(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?'
+            ]
+            
+            # Time patterns
+            time_patterns = [
+                r'\d{1,2}:\d{2}\s*(?:am|pm)?',
+                r'\d{1,2}\s*(?:am|pm)'
+            ]
+            
+            # Current time for comparison
+            now = datetime.now()
+            
+            # Look for dates in the text
+            for pattern in date_patterns:
+                matches = re.finditer(pattern, text.lower())
+                for match in matches:
+                    try:
+                        # Parse the date string
+                        date_str = match.group()
+                        # Try different date formats
+                        for fmt in ['%B %d, %Y', '%B %d %Y', '%b %d, %Y', '%b %d %Y', 
+                                  '%m/%d/%Y', '%m/%d/%y', '%Y-%m-%d']:
+                            try:
+                                date = datetime.strptime(date_str, fmt)
+                                if date < now:
+                                    return True
+                            except ValueError:
+                                continue
+                    except:
+                        continue
+            
+            return False
+        except:
+            return False
+
     def _analyze_email_content(self, subject: str, body: str, sender: str) -> Dict[str, bool]:
         """
-        Analyze email content using rule-based classification.
+        Analyze email content using OpenAI's GPT model.
         Returns a dictionary of classifications.
         """
+        try:
+            # Prepare the message for GPT
+            system_prompt = """You are an email classifier that analyzes emails and determines their categories.
+            Classify the email into these categories:
+            1. is_receipt: Is this a receipt, order confirmation, financial transaction, or DoorDash order?
+            2. is_marketing: Is this a marketing or promotional email, or does it have an unsubscribe option?
+            3. is_important: Is this an important email that needs attention?
+            4. should_delete: Should this email be deleted?
+            5. is_past_appointment: Is this an appointment reminder for a date that has already passed?
+            
+            Respond with a JSON object containing boolean values for each category.
+            Consider:
+            - Receipts include:
+              * Order confirmations and payment notifications
+              * Financial transactions
+              * DoorDash orders and delivery confirmations
+              * Any purchase or payment related email
+            - Marketing emails include:
+              * ANY email that has an unsubscribe link or option
+              * Promotional content and advertisements
+              * Newsletters and updates
+              * Sales and special offers
+            - Important emails include:
+              * Security alerts and account notifications
+              * Personal communications
+              * Work-related content
+              * Time-sensitive information
+              * Medical or health-related communications
+              * Direct communications from teachers/schools about current students
+            - Past appointments include:
+              * Calendar notifications for past dates
+              * Appointment reminders for dates that have passed
+              * Meeting confirmations for past events
+            - Emails should be deleted if:
+              * They have an unsubscribe option
+              * They are marketing/promotional
+              * They are not important
+            
+            Pay special attention to security-related emails (password changes, security alerts, account notifications) - 
+            these should ALWAYS be marked as important regardless of the sender."""
+
+            user_prompt = f"""Subject: {subject}
+            From: {sender}
+            Content: {body[:1000]}  # Limit content length for token usage
+            
+            Classify this email based on the given categories."""
+
+            # Make API call
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+
+            # Update usage tracking
+            usage = response.usage
+            self.input_tokens += usage.prompt_tokens
+            self.output_tokens += usage.completion_tokens
+            self.total_tokens_used += usage.total_tokens
+            self.total_api_calls += 1
+            
+            # Calculate cost (based on current GPT-3.5-turbo pricing)
+            input_cost = (usage.prompt_tokens / 1000) * 0.0005
+            output_cost = (usage.completion_tokens / 1000) * 0.0015
+            self.total_api_cost += input_cost + output_cost
+
+            # Parse the response
+            try:
+                result = json.loads(response.choices[0].message.content)
+                # Ensure all required keys are present
+                required_keys = ['is_receipt', 'is_marketing', 'is_important', 'should_delete', 'is_past_appointment']
+                for key in required_keys:
+                    if key not in result:
+                        result[key] = False
+                return result
+            except json.JSONDecodeError:
+                print(f"Warning: Could not parse AI response for email: {subject}")
+                return {
+                    'is_receipt': False,
+                    'is_marketing': False,
+                    'is_important': False,
+                    'should_delete': False,
+                    'is_past_appointment': False
+                }
+
+        except Exception as e:
+            print(f"Warning: AI analysis failed for email: {subject}. Error: {str(e)}")
+            # Fallback to rule-based classification
+            return self._rule_based_classification(subject, body, sender)
+
+    def _rule_based_classification(self, subject: str, body: str, sender: str) -> Dict[str, bool]:
+        """Fallback rule-based classification when AI analysis fails."""
         # Initialize result
         result = {
             'is_receipt': False,
             'is_marketing': False,
             'is_important': False,
-            'should_delete': False
+            'should_delete': False,
+            'is_past_appointment': False
         }
         
         # Convert to lowercase for case-insensitive matching
         subject_lower = subject.lower()
         sender_lower = sender.lower()
-        body_lower = body.lower()[:1000]  # Limit content length for performance
+        body_lower = body.lower()[:1000]
         
         # Receipt patterns
         receipt_keywords = [
             'receipt', 'order confirmation', 'invoice', 'payment confirmation',
-            'your order', 'transaction', 'purchase', 'payment received'
+            'your order', 'transaction', 'purchase', 'payment received',
+            'doordash order', 'your doordash order', 'order from doordash',
+            'delivery confirmation', 'order #', 'payment processed',
+            'your receipt from apple', 'receipt from apple', 'subscription is expiring',
+            'order id:', 'subscription expiring', 'subscription renewal'
         ]
-        # Check for dollar amounts
         dollar_pattern = r'\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?'
         has_dollar_amount = bool(re.search(dollar_pattern, body) or re.search(dollar_pattern, subject))
         
+        # Check for DoorDash specifically
+        is_doordash = 'doordash' in sender_lower or 'doordash' in subject_lower
+        
+        # Check for Apple specifically
+        is_apple = 'apple' in sender_lower and ('receipt' in subject_lower or 'subscription' in subject_lower)
+        
         result['is_receipt'] = has_dollar_amount or any(keyword in subject_lower or keyword in body_lower 
-                                                       for keyword in receipt_keywords)
+                                                       for keyword in receipt_keywords) or is_doordash or is_apple
+        
+        # Check for unsubscribe link/text
+        unsubscribe_patterns = [
+            'unsubscribe', 'opt-out', 'opt out', 'email preferences',
+            'email settings', 'manage subscriptions', 'manage your preferences',
+            'update your preferences', 'subscription center'
+        ]
+        has_unsubscribe = any(pattern in body_lower for pattern in unsubscribe_patterns)
         
         # Marketing patterns
         marketing_keywords = [
-            'unsubscribe', 'newsletter', 'subscription', 'marketing',
+            'newsletter', 'subscription', 'marketing',
             'special offer', 'discount', 'sale', 'promotion', 'deal',
-            'limited time', 'exclusive offer', 'off selected', '% off'
+            'exclusive', 'limited time', 'early bird', 'sign up now',
+            'register today', 'join us', 'don\'t miss'
         ]
-        marketing_patterns = [
-            r'view.*online',
-            r'click here',
-            r'\d+% off',
-            r'save up to',
-            r'limited time'
+        result['is_marketing'] = has_unsubscribe or any(keyword in subject_lower or keyword in body_lower 
+                                                   for keyword in marketing_keywords)
+        
+        # Security and important patterns
+        security_keywords = [
+            'security', 'password', 'login', 'account', 'verify',
+            'authentication', 'protect', 'suspicious', 'unauthorized',
+            'alert', 'warning', 'important notice'
         ]
         
-        result['is_marketing'] = (
-            any(keyword in subject_lower or keyword in body_lower for keyword in marketing_keywords) or
-            any(re.search(pattern, body_lower) for pattern in marketing_patterns)
-        )
+        # Check if email is security related
+        is_security_related = any(keyword in subject_lower or keyword in body_lower 
+                                for keyword in security_keywords)
         
-        # Important email patterns
-        important_keywords = [
-            'urgent', 'important', 'action required', 'deadline',
-            'account', 'security', 'password', 'payment due',
-            'meeting', 'interview', 'appointment'
-        ]
-        # Check if sender is from important domains
+        # Important patterns
         important_domains = os.getenv('IMPORTANT_DOMAINS', '').split(',')
         sender_domain = sender_lower.split('@')[-1] if '@' in sender_lower else ''
         
         result['is_important'] = (
-            any(keyword in subject_lower for keyword in important_keywords) or
-            any(domain in sender_domain for domain in important_domains) or
-            self.classifier.is_important_sender(sender)
+            is_security_related or
+            sender_domain in important_domains or
+            sender in self.classifier.known_contacts
         )
         
-        # Determine if email should be deleted
-        result['should_delete'] = (
-            result['is_marketing'] and not result['is_important'] and not result['is_receipt']
-        )
+        # Deletion criteria
+        # Delete if it has unsubscribe option or is marketing, unless it's important
+        result['should_delete'] = (has_unsubscribe or result['is_marketing']) and not result['is_important']
+        
+        # Appointment patterns
+        appointment_keywords = [
+            'appointment', 'reminder', 'meeting', 'scheduled', 'calendar',
+            'appointment confirmation', 'your appointment', 'upcoming appointment',
+            'meeting reminder', 'event reminder', 'reservation'
+        ]
+        
+        # Check if it's an appointment email
+        is_appointment = any(keyword in subject_lower or keyword in body_lower 
+                            for keyword in appointment_keywords)
+        
+        if is_appointment:
+            result['is_past_appointment'] = self._is_past_date(subject + ' ' + body_lower, 
+                                                              datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         
         return result
 
@@ -319,13 +495,67 @@ class EmailProcessor:
             print(f"Warning: Could not get email content: {str(e)}")
             return '', '', ''
 
+    def _get_list_identifier(self, headers) -> str:
+        """Extract a unique identifier for the mailing list from headers."""
+        # Try List-ID header first
+        list_id = next((h['value'] for h in headers if h['name'] == 'List-ID'), None)
+        if list_id:
+            return list_id
+
+        # Try List-Unsubscribe header
+        unsubscribe = next((h['value'] for h in headers if h['name'] == 'List-Unsubscribe'), None)
+        if unsubscribe:
+            return unsubscribe
+
+        # Fallback to From header
+        from_header = next((h['value'] for h in headers if h['name'] == 'From'), '')
+        return from_header
+
+    def _bulk_delete_from_list(self, list_identifier: str):
+        """Delete all emails from the same mailing list."""
+        if self.dry_run:
+            print(f"Would delete all emails from: {list_identifier}")
+            return
+
+        try:
+            # Construct search query based on list identifier
+            if '@' in list_identifier:
+                # If it's an email address, search by from:
+                query = f'from:({list_identifier})'
+            else:
+                # Otherwise search in full text
+                # Escape special characters in the list identifier
+                safe_id = list_identifier.replace('"', '').replace('\'', '')
+                query = f'"{safe_id}"'
+
+            # Search for all emails from this list
+            results = self.service.users().messages().list(
+                userId='me',
+                q=query
+            ).execute()
+
+            messages = results.get('messages', [])
+            if messages:
+                print(f"Found {len(messages)} additional emails from this mailing list")
+                for message in messages:
+                    self._delete_message(message['id'])
+                    self.deleted_details.append({
+                        'id': message['id'],
+                        'subject': 'Bulk deleted from mailing list',
+                        'sender': list_identifier,
+                        'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+
+        except Exception as e:
+            print(f"Error in bulk deletion: {str(e)}")
+
     def _process_message(self, message_id):
         """Process a single message using rule-based analysis."""
         message = self.service.users().messages().get(
             userId='me',
             id=message_id,
             format='metadata',
-            metadataHeaders=['From', 'Subject', 'List-Unsubscribe']
+            metadataHeaders=['From', 'Subject', 'List-Unsubscribe', 'List-ID']
         ).execute()
 
         headers = message['payload']['headers']
@@ -357,6 +587,11 @@ class EmailProcessor:
             self.receipt_details.append(email_details)
             return
 
+        # Handle past appointments
+        if analysis.get('is_past_appointment', False):
+            self._archive_message(message_id)
+            return
+
         # Handle important emails
         if analysis['is_important']:
             self.important_details.append(email_details)
@@ -366,7 +601,18 @@ class EmailProcessor:
         if analysis['is_marketing']:
             self.marketing_deletions += 1
             self.marketing_details.append(email_details)
+            
+            # Get list identifier before unsubscribing
+            list_identifier = self._get_list_identifier(headers)
+            
+            # Try to unsubscribe
             self._handle_unsubscribe(message_id, headers)
+            
+            # Bulk delete all emails from this list
+            if list_identifier:
+                self._bulk_delete_from_list(list_identifier)
+            
+            return
 
         # Handle emails that should be deleted
         if analysis['should_delete']:
@@ -461,33 +707,54 @@ class EmailProcessor:
             ).execute()
         self.deleted_count += 1
 
+    def _archive_message(self, message_id):
+        """Archive a message by removing it from the inbox."""
+        if self.dry_run:
+            print(f"Would archive message: {message_id}")
+        else:
+            try:
+                self.service.users().messages().modify(
+                    userId='me',
+                    id=message_id,
+                    body={'removeLabelIds': ['INBOX']}
+                ).execute()
+            except Exception as e:
+                print(f"Error archiving message {message_id}: {str(e)}")
+
     def _print_summary(self):
-        """Print a summary of the processing results with detailed information."""
+        """Print summary of email processing including API usage statistics."""
         print("\nProcessing Summary:")
         print(f"Total messages processed: {self.processed_count}")
         print(f"Messages deleted: {self.deleted_count}")
         
-        print("\nReceipts found ({len(self.receipt_details)}):")
-        for receipt in self.receipt_details:
-            print(f"  - [{receipt['date']}] {receipt['subject']} (From: {receipt['sender']})")
+        print(f"\nReceipts found ({len(self.receipt_details)}):")
+        for detail in self.receipt_details:
+            print(f"  - {detail}")
             
-        print("\nMarketing emails ({len(self.marketing_details)}):")
-        for marketing in self.marketing_details:
-            print(f"  - [{marketing['date']}] {marketing['subject']} (From: {marketing['sender']})")
+        print(f"\nMarketing emails ({len(self.marketing_details)}):")
+        for detail in self.marketing_details:
+            print(f"  - {detail}")
             
-        print("\nImportant emails preserved ({len(self.important_details)}):")
-        for important in self.important_details:
-            print(f"  - [{important['date']}] {important['subject']} (From: {important['sender']})")
+        print(f"\nImportant emails preserved ({len(self.important_details)}):")
+        for detail in self.important_details:
+            print(f"  - {detail}")
             
-        print("\nEmails to be deleted ({len(self.deleted_details)}):")
-        for deleted in self.deleted_details:
-            print(f"  - [{deleted['date']}] {deleted['subject']} (From: {deleted['sender']})")
-            
+        print(f"\nEmails to be deleted ({len(self.deleted_details)}):")
+        for detail in self.deleted_details:
+            print(f"  - {detail}")
+        
         print("\nDeletion reasons:")
         print(f"  - Marketing emails: {self.marketing_deletions}")
         print(f"  - Old unread emails: {self.old_unread_deletions}")
         print(f"Receipts archived: {self.receipts_archived}")
         print(f"Unsubscribe attempts: {self.unsubscribed_count}")
+        
+        print("\nAPI Usage Statistics:")
+        print(f"Total API calls: {self.total_api_calls}")
+        print(f"Total tokens used: {self.total_tokens_used}")
+        print(f"  - Input tokens: {self.input_tokens}")
+        print(f"  - Output tokens: {self.output_tokens}")
+        print(f"Estimated cost: ${self.total_api_cost:.4f}")
         
         if self.dry_run:
             print("\nThis was a dry run. No emails were actually deleted, archived, or unsubscribed.") 
